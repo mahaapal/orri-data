@@ -1,73 +1,93 @@
+# scripts/build_orri.py
 import os
 import pandas as pd
 from fredapi import Fred
 
-fred = Fred(api_key=os.environ["FRED_API_KEY"])
+# --- Config ---
+START_DATE = "1995-01-01"
 
+# FRED series (all valid as of 2025-08)
 SERIES = {
-    "TEMPHELPS": "TEMPHELPS",            # Temp help employment (monthly, SA)
-    "HTRUCKSSA": "HTRUCKSSA",            # Heavy weight truck sales (monthly, SA)
-    "CES7072200001": "CES7072200001",    # Restaurants & bars jobs (monthly, SA)
-    "AWHAEMAN": "AWHAEMAN",              # Mfg weekly hours (monthly, SA)
-    "BUSINV": "BUSINV",                  # Business inventories (monthly)
-    "BUSTOTSLS": "BUSTOTSLS",            # Business sales (monthly)
-    "ICSA": "ICSA",                      # Initial claims (weekly, SA)
-    "RAILFRTCARLOADSD11": "RAILFRTCARLOADSD11"  # Rail carloads (monthly, SA)
+    "TEMPHELPS": "TEMPHELPS",                 # Temp help employment (SA, monthly)
+    "HTRUCKSSA": "HTRUCKSSA",                 # Heavy truck sales (SA, monthly, level)
+    "CES7072200001": "CES7072200001",         # Restaurants & bars employment (SA, monthly)
+    "AWHAEMAN": "AWHAEMAN",                   # Manufacturing weekly hours (SA, monthly)
+    "TOTBUSSMSA": "TOTBUSSMSA",               # Total business sales (SA, monthly)
+    "ICSA": "ICSA",                           # Initial jobless claims (SA, weekly)
+    "RAILFRTCARLOADSD11": "RAILFRTCARLOADSD11",  # Rail carloads (SA, monthly)
+    "ISRATIO": "ISRATIO",                     # Inventories-to-Sales ratio (Total business, monthly)
 }
 
-def get_monthly(series_id, start="1995-01-01"):
-    """Fetch a FRED series and return month-end frequency.
-       Weekly/daily series are end-of-month via .last()."""
-    s = fred.get_series(series_id, observation_start=start)
-    s = s.to_frame(series_id)
-    s.index = pd.to_datetime(s.index)
-    return s.resample("ME").last()   # month-end
+# ORRI logic: +1 if rising vs 6 months ago, -1 if falling, 0 otherwise
+# "Bad when rising": claims (ICSA) and ISRATIO (inventories piling up).
+BAD_WHEN_RISING = {"ICSA", "ISRATIO"}
+LOOKBACK_MONTHS = 6
 
-def sign_trend(series, months=6):
-    """+1 if rising vs N months ago, -1 if falling, 0 if flat/NaN."""
-    if len(series) <= months:
+def get_env_api_key():
+    key = os.environ.get("FRED_API_KEY")
+    if not key:
+        raise RuntimeError("Missing FRED_API_KEY environment variable")
+    return key
+
+def fetch_series_month_end(fred: Fred, series_id: str, start=START_DATE) -> pd.DataFrame:
+    """Fetch series and return a month-end (ME) indexed DataFrame with the series_id as column."""
+    s = fred.get_series(series_id, observation_start=start)
+    if s is None or len(s) == 0:
+        raise RuntimeError(f"No data returned for {series_id}")
+    df = s.to_frame(series_id)
+    df.index = pd.to_datetime(df.index)
+    # Ensure month-end frequency (ME replaces deprecated "M")
+    df = df.resample("ME").last()
+    return df
+
+def sign_trend(series: pd.Series, months: int = LOOKBACK_MONTHS) -> int:
+    """Return +1, 0, -1 comparing latest to N months ago."""
+    if series.isna().any() or len(series) <= months:
         return 0
     cur = series.iloc[-1]
     prev = series.iloc[-months]
     if pd.isna(cur) or pd.isna(prev):
         return 0
-    return 1 if cur > prev else (-1 if cur < prev else 0)
+    if cur > prev: return 1
+    if cur < prev: return -1
+    return 0
 
 def main():
+    fred = Fred(api_key=get_env_api_key())
+
+    # Fetch all series
     frames = []
     for name, code in SERIES.items():
-        try:
-            frames.append(get_monthly(code).rename(columns={code: name}))
-        except Exception as e:
-            raise RuntimeError(f"Failed fetching {name} ({code}): {e}")
+        df = fetch_series_month_end(fred, code)
+        frames.append(df.rename(columns={code: name}))
 
-    df = pd.concat(frames, axis=1)
+    # Combine on month-end index
+    data = pd.concat(frames, axis=1)
 
-    # Inventory-to-Sales ratio
-    df["INV_SALES_RATIO"] = df["BUSINV"] / df["BUSTOTSLS"]
-
-    # ORRI score (sum of component trend signs; invert bad = rising claims & rising I/S)
-    scores = []
-    for i in range(len(df)):
-        sub = df.iloc[: i+1]
-        if len(sub) < 7:
-            scores.append(float("nan"))
+    # Compute ORRI as sum of component trend signs (invert "bad-when-rising")
+    orri_vals = []
+    for i in range(len(data)):
+        sub = data.iloc[: i + 1]
+        if len(sub) <= LOOKBACK_MONTHS:
+            orri_vals.append(float("nan"))
             continue
         score = 0
-        score += sign_trend(sub["TEMPHELPS"])
-        score += sign_trend(sub["HTRUCKSSA"])
-        score += sign_trend(sub["CES7072200001"])
-        score += -sign_trend(sub["ICSA"])                # rising claims = bad
-        score += sign_trend(sub["RAILFRTCARLOADSD11"])
-        score += -sign_trend(sub["INV_SALES_RATIO"])     # rising I/S = bad
-        score += sign_trend(sub["AWHAEMAN"])
-        scores.append(score)
+        for col in SERIES.keys():
+            sig = sign_trend(sub[col])
+            if col in BAD_WHEN_RISING:
+                sig = -sig
+            score += sig
+        orri_vals.append(score)
 
-    df["ORRI"] = scores
+    out = data.copy()
+    out["ORRI"] = orri_vals
 
+    # Save
     os.makedirs("data", exist_ok=True)
-    df.to_csv("data/orri.csv", index_label="Date")
+    out.to_csv("data/orri.csv", index_label="Date")
+    print("Wrote data/orri.csv")
 
 if __name__ == "__main__":
     main()
+
 
